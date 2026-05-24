@@ -11,12 +11,12 @@ project "App"
     objdir ("bin-int/%{cfg.buildcfg}")
 
 files {
-    "IluminacionBasica/src/main.cpp",
-    "IluminacionBasica/src/glad.c",
+    "src/main.cpp",
+    "src/glad.c",
     "src/cube.h",
-    "IluminacionBasica/src/shader.vert",
-    "IluminacionBasica/src/*.c"
-    "IluminacionBasica/src/shader.frag"
+    "src/shader.vert",
+    "src/*.c",
+    "src/shader.frag",
 }
 
     includedirs {
