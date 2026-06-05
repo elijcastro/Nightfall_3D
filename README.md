@@ -21,9 +21,9 @@ Crear carpeta de build
 mkdir build
 cd build
 
-Generar proyecto con CMake
-cmake .. -G "Visual Studio 18 2026" -A x64 -DCMAKE_TOOLCHAIN_FILE=../vcpkg/scripts/buildsystems/vcpkg.cmake
-
+Generar proyecto con CMake: 
+cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE=../vcpkg/scripts/buildsystems/vcpkg.cmake
+"Para lo anteior deben tener instalado Visual studio 2022"
 Compilar
 cmake --build . --config Debug
 
