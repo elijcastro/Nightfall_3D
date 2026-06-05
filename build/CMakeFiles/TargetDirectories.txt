@@ -1,0 +1,3 @@
+C:/Laboratorios_OPENGL/Nightfall_3D/build/CMakeFiles/Nightfall_3D.dir
+C:/Laboratorios_OPENGL/Nightfall_3D/build/CMakeFiles/ALL_BUILD.dir
+C:/Laboratorios_OPENGL/Nightfall_3D/build/CMakeFiles/ZERO_CHECK.dir
