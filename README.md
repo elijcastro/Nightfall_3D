@@ -131,8 +131,8 @@ Versión de Windows y Visual Studio
 Licencia
 MIT License (o la que prefieras)
 
-Autor
-Eli Josué Castro
+Autores
+*Nombres pendientes*
 Desarrollador del motor Nightfall_3D
 
 CMake los copia automáticamente al directorio del ejecutable.
