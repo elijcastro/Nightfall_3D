@@ -14,7 +14,7 @@ struct DirLight {
 
 uniform DirLight dirLight;
 uniform vec3 viewPos;
-uniform sampler2D diffuseMap;
+uniform sampler2D texture_diffuse1;
 uniform float texScale;
 
 void main()
@@ -22,7 +22,7 @@ void main()
     vec3 norm = normalize(Normal);
     vec3 lightDir = normalize(-dirLight.direction);
     vec2 scaledUV = TexCoord * texScale;
-    vec3 texColor = texture(diffuseMap, TexCoord).rgb;
+    vec3 texColor = texture(texture_diffuse1, TexCoord).rgb;
 
     vec3 ambient = dirLight.ambient * texColor;
 
