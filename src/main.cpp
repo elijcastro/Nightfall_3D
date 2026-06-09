@@ -22,6 +22,9 @@
 #include <ctime>
 #include <algorithm>
 #include <limits>
+#include <array>
+#include <cctype>
+#include <string>
 
 #ifdef min
 #undef min
@@ -57,15 +60,24 @@ struct DoorModel {
 };
 
 const float playerRadius = 0.40f;
-const float playerEyeHeight = 1.75f;
-const float playerHeadClearance = 0.20f;
+const float standingPlayerEyeHeight = 1.45f;
+const float standingPlayerHeadClearance = 0.12f;
+const float crouchingPlayerEyeHeight = 0.90f;
+const float crouchingPlayerHeadClearance = 0.10f;
+const float maxStepHeight = 0.65f;
+const float jumpVelocity = 5.2f;
 const float floorY = -7.15f;
+
+float currentPlayerEyeHeight = standingPlayerEyeHeight;
+float currentPlayerHeadClearance = standingPlayerHeadClearance;
+bool isCrouching = false;
 
 AABB playerBox;
 
 std::vector<AABB> worldColliders;
 std::vector<AABB> floorColliders;
 std::vector<DoorModel> doorModels;
+bool jumpWasPressed = false;
 
 AABB MakeAABB(const glm::vec3& a, const glm::vec3& b)
 {
@@ -78,24 +90,66 @@ AABB MakeAABBFromCenter(const glm::vec3& center, const glm::vec3& size)
     return MakeAABB(center - halfSize, center + halfSize);
 }
 
-AABB MakePlayerBox(const glm::vec3& position)
+AABB MakePlayerBox(const glm::vec3& position, float eyeHeight, float headClearance)
 {
     return {
-        glm::vec3(position.x - playerRadius, position.y - playerEyeHeight, position.z - playerRadius),
-        glm::vec3(position.x + playerRadius, position.y + playerHeadClearance, position.z + playerRadius)
+        glm::vec3(position.x - playerRadius, position.y - eyeHeight, position.z - playerRadius),
+        glm::vec3(position.x + playerRadius, position.y + headClearance, position.z + playerRadius)
     };
 }
 
-bool CollidesWithWorld(const glm::vec3& position)
+AABB MakePlayerBox(const glm::vec3& position)
 {
-    AABB candidate = MakePlayerBox(position);
+    return MakePlayerBox(position, currentPlayerEyeHeight, currentPlayerHeadClearance);
+}
+
+bool CollidesWithWorld(const glm::vec3& position, float eyeHeight, float headClearance)
+{
+    AABB candidate = MakePlayerBox(position, eyeHeight, headClearance);
     for (const auto& box : worldColliders)
     {
+        if (box.max.y <= candidate.min.y + 0.02f)
+            continue;
+
         if (CheckCollision(candidate, box))
             return true;
     }
 
     return false;
+}
+
+bool CollidesWithWorld(const glm::vec3& position)
+{
+    return CollidesWithWorld(position, currentPlayerEyeHeight, currentPlayerHeadClearance);
+}
+
+bool FindStepTarget(const glm::vec3& position, float currentFootY, float& targetFootY)
+{
+    AABB candidate = MakePlayerBox(position);
+    float bestStepY = currentFootY;
+    bool foundStep = false;
+
+    for (const auto& box : floorColliders)
+    {
+        bool overlapsX = candidate.max.x > box.min.x && candidate.min.x < box.max.x;
+        bool overlapsZ = candidate.max.z > box.min.z && candidate.min.z < box.max.z;
+        if (!overlapsX || !overlapsZ)
+            continue;
+
+        float topY = box.max.y;
+        float stepDelta = topY - currentFootY;
+        if (stepDelta <= 0.02f || stepDelta > maxStepHeight)
+            continue;
+
+        if (!foundStep || topY < bestStepY)
+        {
+            bestStepY = topY;
+            foundStep = true;
+        }
+    }
+
+    targetFootY = bestStepY;
+    return foundStep;
 }
 
 void AddWorldCollider(const glm::vec3& center, const glm::vec3& size)
@@ -106,6 +160,12 @@ void AddWorldCollider(const glm::vec3& center, const glm::vec3& size)
 void AddFloorCollider(const glm::vec3& center, const glm::vec3& size)
 {
     AABB box = MakeAABBFromCenter(center, size);
+    floorColliders.push_back(box);
+    worldColliders.push_back(box);
+}
+
+void AddFloorCollider(const AABB& box)
+{
     floorColliders.push_back(box);
     worldColliders.push_back(box);
 }
@@ -204,6 +264,47 @@ void AddModelTriangleWallColliders(const Model& model, const glm::mat4& transfor
     }
 }
 
+void AddModelFloorColliders(const Model& model, const glm::mat4& transform)
+{
+    const float minHorizontalNormalY = 0.65f;
+    const float floorThickness = 0.25f;
+    const float topPadding = 0.04f;
+    const float horizontalPadding = 0.03f;
+
+    for (const auto& mesh : model.meshes)
+    {
+        for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3)
+        {
+            const glm::vec3 p0 = glm::vec3(transform * glm::vec4(mesh.vertices[mesh.indices[i]].Position, 1.0f));
+            const glm::vec3 p1 = glm::vec3(transform * glm::vec4(mesh.vertices[mesh.indices[i + 1]].Position, 1.0f));
+            const glm::vec3 p2 = glm::vec3(transform * glm::vec4(mesh.vertices[mesh.indices[i + 2]].Position, 1.0f));
+
+            glm::vec3 normal = glm::cross(p1 - p0, p2 - p0);
+            if (glm::length(normal) < 0.0001f)
+                continue;
+
+            normal = glm::normalize(normal);
+            if (std::fabs(normal.y) < minHorizontalNormalY)
+                continue;
+
+            AABB box = MakeAABB(glm::min(p0, glm::min(p1, p2)), glm::max(p0, glm::max(p1, p2)));
+            glm::vec3 size = box.max - box.min;
+            if (size.x < 0.05f && size.z < 0.05f)
+                continue;
+
+            float topY = box.max.y;
+            box.min.x -= horizontalPadding;
+            box.max.x += horizontalPadding;
+            box.min.z -= horizontalPadding;
+            box.max.z += horizontalPadding;
+            box.min.y = topY - floorThickness;
+            box.max.y = topY + topPadding;
+
+            AddFloorCollider(box);
+        }
+    }
+}
+
 // ---------------------------------------------------------
 // Raycast + Decals
 // ---------------------------------------------------------
@@ -236,6 +337,38 @@ std::vector<Spark> sparks;
 // ---------------------------------------------------------
 const unsigned int SCR_WIDTH  = 1280;
 const unsigned int SCR_HEIGHT = 720;
+
+int gWindowWidth = SCR_WIDTH;
+int gWindowHeight = SCR_HEIGHT;
+
+enum class GameScreen {
+    MainMenu,
+    Instructions,
+    Map,
+    Playing
+};
+
+GameScreen gCurrentScreen = GameScreen::MainMenu;
+
+struct UiRect {
+    float x;
+    float y;
+    float w;
+    float h;
+};
+
+struct UiInput {
+    double mouseX;
+    double mouseY;
+    bool mouseClicked;
+};
+
+bool gMouseWasPressed = false;
+bool gEnterWasPressed = false;
+bool gEscWasPressed = false;
+bool gIWasPressed = false;
+bool gMWasPressed = false;
+bool gCursorIsMenuMode = false;
 
 // ---------------------------------------------------------
 // Cámara y tiempo
@@ -272,16 +405,29 @@ float playerVelocityY = 0.0f;
 float gravity = -9.8f;
 bool isGrounded = false;
 
+bool KeyPressedOnce(GLFWwindow* window, int key, bool& wasPressed);
+void SetCursorForCurrentScreen(GLFWwindow* window);
+
 // ---------------------------------------------------------
 // Callbacks
 // ---------------------------------------------------------
 void framebuffer_size_callback(GLFWwindow* window, int width, int height)
 {
+    gWindowWidth = width;
+    gWindowHeight = height;
     glViewport(0, 0, width, height);
 }
 
 void mouse_callback(GLFWwindow* window, double xpos, double ypos)
 {
+    if (gCurrentScreen != GameScreen::Playing)
+    {
+        firstMouse = true;
+        lastX = (float)xpos;
+        lastY = (float)ypos;
+        return;
+    }
+
     if (firstMouse)
     {
         lastX = (float)xpos;
@@ -324,9 +470,50 @@ glm::vec3 GetMovementInput(GLFWwindow* window)
         movement += right;
 
     if (glm::length(movement) > 0.0001f)
-        movement = glm::normalize(movement) * camera.MovementSpeed * deltaTime;
+    {
+        float speedMultiplier = isCrouching ? 0.55f : 1.0f;
+        movement = glm::normalize(movement) * camera.MovementSpeed * speedMultiplier * deltaTime;
+    }
 
     return movement;
+}
+
+void SetPlayerHeight(float eyeHeight, float headClearance)
+{
+    float footY = camera.Position.y - currentPlayerEyeHeight;
+    currentPlayerEyeHeight = eyeHeight;
+    currentPlayerHeadClearance = headClearance;
+    camera.Position.y = footY + currentPlayerEyeHeight;
+    playerBox = MakePlayerBox(camera.Position);
+}
+
+void UpdateCrouch(GLFWwindow* window)
+{
+    bool wantsCrouch = glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS;
+
+    if (wantsCrouch)
+    {
+        if (!isCrouching)
+        {
+            isCrouching = true;
+            SetPlayerHeight(crouchingPlayerEyeHeight, crouchingPlayerHeadClearance);
+        }
+
+        return;
+    }
+
+    if (!isCrouching)
+        return;
+
+    float footY = camera.Position.y - currentPlayerEyeHeight;
+    glm::vec3 standingPosition = camera.Position;
+    standingPosition.y = footY + standingPlayerEyeHeight;
+
+    if (!CollidesWithWorld(standingPosition, standingPlayerEyeHeight, standingPlayerHeadClearance))
+    {
+        isCrouching = false;
+        SetPlayerHeight(standingPlayerEyeHeight, standingPlayerHeadClearance);
+    }
 }
 
 void MovePlayerWithCollisions(const glm::vec3& delta)
@@ -340,12 +527,44 @@ void MovePlayerWithCollisions(const glm::vec3& delta)
         glm::vec3 candidate = camera.Position;
         candidate.x += step.x;
         if (!CollidesWithWorld(candidate))
+        {
             camera.Position.x = candidate.x;
+        }
+        else if (isGrounded)
+        {
+            float stepFootY = 0.0f;
+            float currentFootY = camera.Position.y - currentPlayerEyeHeight;
+            if (FindStepTarget(candidate, currentFootY, stepFootY))
+            {
+                candidate.y = stepFootY + currentPlayerEyeHeight;
+                if (!CollidesWithWorld(candidate))
+                {
+                    camera.Position = candidate;
+                    playerVelocityY = 0.0f;
+                }
+            }
+        }
 
         candidate = camera.Position;
         candidate.z += step.z;
         if (!CollidesWithWorld(candidate))
+        {
             camera.Position.z = candidate.z;
+        }
+        else if (isGrounded)
+        {
+            float stepFootY = 0.0f;
+            float currentFootY = camera.Position.y - currentPlayerEyeHeight;
+            if (FindStepTarget(candidate, currentFootY, stepFootY))
+            {
+                candidate.y = stepFootY + currentPlayerEyeHeight;
+                if (!CollidesWithWorld(candidate))
+                {
+                    camera.Position = candidate;
+                    playerVelocityY = 0.0f;
+                }
+            }
+        }
     }
 }
 
@@ -357,6 +576,10 @@ void ApplyGravity()
 
     playerBox = MakePlayerBox(camera.Position);
 
+    bool foundCollision = false;
+    float landingY = -std::numeric_limits<float>::max();
+    float ceilingY = std::numeric_limits<float>::max();
+
     for (const auto& box : floorColliders)
     {
         if (!CheckCollision(playerBox, box))
@@ -364,18 +587,31 @@ void ApplyGravity()
 
         if (playerVelocityY <= 0.0f)
         {
-            camera.Position.y = box.max.y + playerEyeHeight;
-            isGrounded = true;
+            landingY = std::max(landingY, box.max.y);
+            foundCollision = true;
         }
         else
         {
-            camera.Position.y = box.min.y - playerHeadClearance;
+            ceilingY = std::min(ceilingY, box.min.y);
+            foundCollision = true;
         }
-
-        playerVelocityY = 0.0f;
-        playerBox = MakePlayerBox(camera.Position);
-        return;
     }
+
+    if (!foundCollision)
+        return;
+
+    if (playerVelocityY <= 0.0f)
+    {
+        camera.Position.y = landingY + currentPlayerEyeHeight;
+        isGrounded = true;
+    }
+    else
+    {
+        camera.Position.y = ceilingY - currentPlayerHeadClearance;
+    }
+
+    playerVelocityY = 0.0f;
+    playerBox = MakePlayerBox(camera.Position);
 }
 
 void processInput(GLFWwindow* window)
@@ -383,10 +619,470 @@ void processInput(GLFWwindow* window)
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, true);
 
+    if (KeyPressedOnce(window, GLFW_KEY_M, gMWasPressed))
+    {
+        gCurrentScreen = GameScreen::Map;
+        gIsFiring = false;
+        SetCursorForCurrentScreen(window);
+        return;
+    }
+
+    UpdateCrouch(window);
+
+    bool jumpPressed = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
+    if (jumpPressed && !jumpWasPressed && isGrounded)
+    {
+        playerVelocityY = jumpVelocity;
+        isGrounded = false;
+    }
+    jumpWasPressed = jumpPressed;
+
     if (glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS)
         gIsFiring = true;
     else
         gIsFiring = false;
+}
+
+std::array<const char*, 7> GetGlyph(char c)
+{
+    switch (c)
+    {
+        case 'A': return { "01110", "10001", "10001", "11111", "10001", "10001", "10001" };
+        case 'B': return { "11110", "10001", "10001", "11110", "10001", "10001", "11110" };
+        case 'C': return { "01111", "10000", "10000", "10000", "10000", "10000", "01111" };
+        case 'D': return { "11110", "10001", "10001", "10001", "10001", "10001", "11110" };
+        case 'E': return { "11111", "10000", "10000", "11110", "10000", "10000", "11111" };
+        case 'F': return { "11111", "10000", "10000", "11110", "10000", "10000", "10000" };
+        case 'G': return { "01111", "10000", "10000", "10111", "10001", "10001", "01111" };
+        case 'H': return { "10001", "10001", "10001", "11111", "10001", "10001", "10001" };
+        case 'I': return { "11111", "00100", "00100", "00100", "00100", "00100", "11111" };
+        case 'J': return { "00111", "00010", "00010", "00010", "10010", "10010", "01100" };
+        case 'K': return { "10001", "10010", "10100", "11000", "10100", "10010", "10001" };
+        case 'L': return { "10000", "10000", "10000", "10000", "10000", "10000", "11111" };
+        case 'M': return { "10001", "11011", "10101", "10101", "10001", "10001", "10001" };
+        case 'N': return { "10001", "11001", "10101", "10011", "10001", "10001", "10001" };
+        case 'O': return { "01110", "10001", "10001", "10001", "10001", "10001", "01110" };
+        case 'P': return { "11110", "10001", "10001", "11110", "10000", "10000", "10000" };
+        case 'Q': return { "01110", "10001", "10001", "10001", "10101", "10010", "01101" };
+        case 'R': return { "11110", "10001", "10001", "11110", "10100", "10010", "10001" };
+        case 'S': return { "01111", "10000", "10000", "01110", "00001", "00001", "11110" };
+        case 'T': return { "11111", "00100", "00100", "00100", "00100", "00100", "00100" };
+        case 'U': return { "10001", "10001", "10001", "10001", "10001", "10001", "01110" };
+        case 'V': return { "10001", "10001", "10001", "10001", "10001", "01010", "00100" };
+        case 'W': return { "10001", "10001", "10001", "10101", "10101", "10101", "01010" };
+        case 'X': return { "10001", "10001", "01010", "00100", "01010", "10001", "10001" };
+        case 'Y': return { "10001", "10001", "01010", "00100", "00100", "00100", "00100" };
+        case 'Z': return { "11111", "00001", "00010", "00100", "01000", "10000", "11111" };
+        case '0': return { "01110", "10001", "10011", "10101", "11001", "10001", "01110" };
+        case '1': return { "00100", "01100", "00100", "00100", "00100", "00100", "01110" };
+        case '2': return { "01110", "10001", "00001", "00010", "00100", "01000", "11111" };
+        case '3': return { "11110", "00001", "00001", "01110", "00001", "00001", "11110" };
+        case '4': return { "00010", "00110", "01010", "10010", "11111", "00010", "00010" };
+        case '5': return { "11111", "10000", "10000", "11110", "00001", "00001", "11110" };
+        case '6': return { "01110", "10000", "10000", "11110", "10001", "10001", "01110" };
+        case '7': return { "11111", "00001", "00010", "00100", "01000", "01000", "01000" };
+        case '8': return { "01110", "10001", "10001", "01110", "10001", "10001", "01110" };
+        case '9': return { "01110", "10001", "10001", "01111", "00001", "00001", "01110" };
+        case '-': return { "00000", "00000", "00000", "11111", "00000", "00000", "00000" };
+        case ':': return { "00000", "00100", "00100", "00000", "00100", "00100", "00000" };
+        case '.': return { "00000", "00000", "00000", "00000", "00000", "00100", "00100" };
+        case '/': return { "00001", "00010", "00010", "00100", "01000", "01000", "10000" };
+        default:  return { "00000", "00000", "00000", "00000", "00000", "00000", "00000" };
+    }
+}
+
+bool IsInsideRect(const UiRect& rect, double x, double y)
+{
+    return x >= rect.x && x <= rect.x + rect.w &&
+           y >= rect.y && y <= rect.y + rect.h;
+}
+
+bool KeyPressedOnce(GLFWwindow* window, int key, bool& wasPressed)
+{
+    bool pressed = glfwGetKey(window, key) == GLFW_PRESS;
+    bool clicked = pressed && !wasPressed;
+    wasPressed = pressed;
+    return clicked;
+}
+
+UiInput ReadUiInput(GLFWwindow* window)
+{
+    double mouseX = 0.0;
+    double mouseY = 0.0;
+    glfwGetCursorPos(window, &mouseX, &mouseY);
+
+    bool mousePressed = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+    bool mouseClicked = mousePressed && !gMouseWasPressed;
+    gMouseWasPressed = mousePressed;
+
+    return { mouseX, mouseY, mouseClicked };
+}
+
+UiRect CenteredRect(float width, float height, float y)
+{
+    return { ((float)gWindowWidth - width) * 0.5f, y, width, height };
+}
+
+UiRect MainMenuButtonRect(int index)
+{
+    const float width = 360.0f;
+    const float height = 58.0f;
+    const float gap = 20.0f;
+    const float firstY = (float)gWindowHeight * 0.43f;
+    return CenteredRect(width, height, firstY + index * (height + gap));
+}
+
+UiRect BackButtonRect()
+{
+    return { 44.0f, (float)gWindowHeight - 86.0f, 190.0f, 50.0f };
+}
+
+void SetCursorForCurrentScreen(GLFWwindow* window)
+{
+    bool menuMode = gCurrentScreen != GameScreen::Playing;
+    if (gCursorIsMenuMode == menuMode)
+        return;
+
+    glfwSetInputMode(window, GLFW_CURSOR, menuMode ? GLFW_CURSOR_NORMAL : GLFW_CURSOR_DISABLED);
+    gCursorIsMenuMode = menuMode;
+    firstMouse = true;
+
+    if (!menuMode)
+    {
+        lastX = (float)gWindowWidth * 0.5f;
+        lastY = (float)gWindowHeight * 0.5f;
+        glfwSetCursorPos(window, lastX, lastY);
+    }
+}
+
+void StartGame(GLFWwindow* window)
+{
+    gCurrentScreen = GameScreen::Playing;
+    gMouseWasPressed = false;
+    gIsFiring = false;
+    SetCursorForCurrentScreen(window);
+    lastFrame = (float)glfwGetTime();
+    deltaTime = 0.0f;
+}
+
+void ProcessMenuInput(GLFWwindow* window)
+{
+    SetCursorForCurrentScreen(window);
+    gIsFiring = false;
+
+    UiInput input = ReadUiInput(window);
+    bool enterPressed = KeyPressedOnce(window, GLFW_KEY_ENTER, gEnterWasPressed);
+    bool escPressed = KeyPressedOnce(window, GLFW_KEY_ESCAPE, gEscWasPressed);
+    bool iPressed = KeyPressedOnce(window, GLFW_KEY_I, gIWasPressed);
+    bool mPressed = KeyPressedOnce(window, GLFW_KEY_M, gMWasPressed);
+
+    if (gCurrentScreen == GameScreen::MainMenu)
+    {
+        if ((input.mouseClicked && IsInsideRect(MainMenuButtonRect(0), input.mouseX, input.mouseY)) || enterPressed)
+        {
+            StartGame(window);
+            return;
+        }
+
+        if ((input.mouseClicked && IsInsideRect(MainMenuButtonRect(1), input.mouseX, input.mouseY)) || iPressed)
+        {
+            gCurrentScreen = GameScreen::Instructions;
+            return;
+        }
+
+        if ((input.mouseClicked && IsInsideRect(MainMenuButtonRect(2), input.mouseX, input.mouseY)) || mPressed)
+        {
+            gCurrentScreen = GameScreen::Map;
+            return;
+        }
+
+        if (escPressed)
+            glfwSetWindowShouldClose(window, true);
+
+        return;
+    }
+
+    if (gCurrentScreen == GameScreen::Map && (mPressed || enterPressed))
+    {
+        StartGame(window);
+        return;
+    }
+
+    if ((input.mouseClicked && IsInsideRect(BackButtonRect(), input.mouseX, input.mouseY)) || escPressed)
+        gCurrentScreen = GameScreen::MainMenu;
+}
+
+void DrawUiRect(Shader& shader, unsigned int uiVAO, unsigned int uiVBO,
+                const UiRect& rect, const glm::vec3& color, float alpha)
+{
+    if (rect.w <= 0.0f || rect.h <= 0.0f || gWindowWidth <= 0 || gWindowHeight <= 0)
+        return;
+
+    float left = (rect.x / (float)gWindowWidth) * 2.0f - 1.0f;
+    float right = ((rect.x + rect.w) / (float)gWindowWidth) * 2.0f - 1.0f;
+    float top = 1.0f - (rect.y / (float)gWindowHeight) * 2.0f;
+    float bottom = 1.0f - ((rect.y + rect.h) / (float)gWindowHeight) * 2.0f;
+
+    float vertices[] = {
+        left,  bottom, 0.0f, 0.0f,
+        right, bottom, 1.0f, 0.0f,
+        right, top,    1.0f, 1.0f,
+        right, top,    1.0f, 1.0f,
+        left,  top,    0.0f, 1.0f,
+        left,  bottom, 0.0f, 0.0f
+    };
+
+    shader.use();
+    shader.setBool("useTexture", false);
+    shader.setVec3("tintColor", color);
+    shader.setFloat("alpha", alpha);
+
+    glBindVertexArray(uiVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, uiVBO);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
+void DrawUiOutline(Shader& shader, unsigned int uiVAO, unsigned int uiVBO,
+                   const UiRect& rect, const glm::vec3& color, float alpha, float thickness)
+{
+    DrawUiRect(shader, uiVAO, uiVBO, { rect.x, rect.y, rect.w, thickness }, color, alpha);
+    DrawUiRect(shader, uiVAO, uiVBO, { rect.x, rect.y + rect.h - thickness, rect.w, thickness }, color, alpha);
+    DrawUiRect(shader, uiVAO, uiVBO, { rect.x, rect.y, thickness, rect.h }, color, alpha);
+    DrawUiRect(shader, uiVAO, uiVBO, { rect.x + rect.w - thickness, rect.y, thickness, rect.h }, color, alpha);
+}
+
+float TextWidth(const std::string& text, float scale)
+{
+    int lineLength = 0;
+    int maxLength = 0;
+
+    for (char c : text)
+    {
+        if (c == '\n')
+        {
+            maxLength = std::max(maxLength, lineLength);
+            lineLength = 0;
+        }
+        else
+        {
+            ++lineLength;
+        }
+    }
+
+    maxLength = std::max(maxLength, lineLength);
+    if (maxLength == 0)
+        return 0.0f;
+
+    return maxLength * scale * 6.0f - scale;
+}
+
+void DrawText(Shader& shader, unsigned int uiVAO, unsigned int uiVBO,
+              const std::string& text, float x, float y, float scale,
+              const glm::vec3& color, float alpha = 1.0f)
+{
+    float startX = x;
+    float cursorX = x;
+    float cursorY = y;
+
+    for (char raw : text)
+    {
+        if (raw == '\n')
+        {
+            cursorX = startX;
+            cursorY += scale * 9.0f;
+            continue;
+        }
+
+        char c = (char)std::toupper((unsigned char)raw);
+        std::array<const char*, 7> glyph = GetGlyph(c);
+
+        for (int row = 0; row < 7; ++row)
+        {
+            for (int col = 0; col < 5; ++col)
+            {
+                if (glyph[row][col] == '1')
+                {
+                    DrawUiRect(shader, uiVAO, uiVBO,
+                        { cursorX + col * scale, cursorY + row * scale, scale, scale },
+                        color, alpha);
+                }
+            }
+        }
+
+        cursorX += scale * 6.0f;
+    }
+}
+
+void DrawCenteredText(Shader& shader, unsigned int uiVAO, unsigned int uiVBO,
+                      const std::string& text, const UiRect& rect, float scale,
+                      const glm::vec3& color, float alpha = 1.0f)
+{
+    float width = TextWidth(text, scale);
+    float height = scale * 7.0f;
+    DrawText(shader, uiVAO, uiVBO, text,
+        rect.x + (rect.w - width) * 0.5f,
+        rect.y + (rect.h - height) * 0.5f,
+        scale, color, alpha);
+}
+
+void DrawMenuButton(Shader& shader, unsigned int uiVAO, unsigned int uiVBO,
+                    const UiRect& rect, const std::string& label, double mouseX, double mouseY)
+{
+    bool hovered = IsInsideRect(rect, mouseX, mouseY);
+    glm::vec3 fill = hovered ? glm::vec3(0.48f, 0.10f, 0.08f) : glm::vec3(0.18f, 0.04f, 0.05f);
+    glm::vec3 border = hovered ? glm::vec3(0.98f, 0.78f, 0.28f) : glm::vec3(0.55f, 0.16f, 0.14f);
+
+    DrawUiRect(shader, uiVAO, uiVBO, rect, fill, 0.92f);
+    DrawUiOutline(shader, uiVAO, uiVBO, rect, border, 1.0f, 3.0f);
+    DrawCenteredText(shader, uiVAO, uiVBO, label, rect, 4.0f, glm::vec3(0.96f, 0.91f, 0.80f), 1.0f);
+}
+
+void DrawMapWorldRect(Shader& shader, unsigned int uiVAO, unsigned int uiVBO,
+                      const UiRect& mapRect, float minX, float minZ, float maxX, float maxZ,
+                      const glm::vec3& color, float alpha)
+{
+    const float worldMinX = -28.0f;
+    const float worldMaxX = -2.0f;
+    const float worldMinZ = -18.0f;
+    const float worldMaxZ = 23.0f;
+
+    float x0 = mapRect.x + ((minX - worldMinX) / (worldMaxX - worldMinX)) * mapRect.w;
+    float x1 = mapRect.x + ((maxX - worldMinX) / (worldMaxX - worldMinX)) * mapRect.w;
+    float y0 = mapRect.y + mapRect.h - ((maxZ - worldMinZ) / (worldMaxZ - worldMinZ)) * mapRect.h;
+    float y1 = mapRect.y + mapRect.h - ((minZ - worldMinZ) / (worldMaxZ - worldMinZ)) * mapRect.h;
+
+    DrawUiRect(shader, uiVAO, uiVBO,
+        { std::min(x0, x1), std::min(y0, y1), std::fabs(x1 - x0), std::fabs(y1 - y0) },
+        color, alpha);
+}
+
+glm::vec2 WorldToMapPoint(const UiRect& mapRect, const glm::vec3& worldPos)
+{
+    const float worldMinX = -28.0f;
+    const float worldMaxX = -2.0f;
+    const float worldMinZ = -18.0f;
+    const float worldMaxZ = 23.0f;
+
+    float x = mapRect.x + ((worldPos.x - worldMinX) / (worldMaxX - worldMinX)) * mapRect.w;
+    float y = mapRect.y + mapRect.h - ((worldPos.z - worldMinZ) / (worldMaxZ - worldMinZ)) * mapRect.h;
+    return glm::vec2(x, y);
+}
+
+void DrawMainMenu(Shader& shader, unsigned int uiVAO, unsigned int uiVBO, double mouseX, double mouseY)
+{
+    DrawUiRect(shader, uiVAO, uiVBO, { 0.0f, 0.0f, (float)gWindowWidth, (float)gWindowHeight },
+        glm::vec3(0.02f, 0.02f, 0.025f), 0.78f);
+
+    UiRect titleArea = CenteredRect(760.0f, 90.0f, 88.0f);
+    DrawCenteredText(shader, uiVAO, uiVBO, "NIGHTFALL 3D",
+        { titleArea.x + 5.0f, titleArea.y + 5.0f, titleArea.w, titleArea.h },
+        8.0f, glm::vec3(0.0f, 0.0f, 0.0f), 0.55f);
+    DrawCenteredText(shader, uiVAO, uiVBO, "NIGHTFALL 3D",
+        titleArea, 8.0f, glm::vec3(0.96f, 0.18f, 0.10f), 1.0f);
+
+    UiRect subtitleArea = CenteredRect(360.0f, 34.0f, 192.0f);
+    DrawCenteredText(shader, uiVAO, uiVBO, "MENU DE INICIO",
+        subtitleArea, 3.0f, glm::vec3(0.78f, 0.82f, 0.74f), 1.0f);
+
+    DrawMenuButton(shader, uiVAO, uiVBO, MainMenuButtonRect(0), "ENTRAR", mouseX, mouseY);
+    DrawMenuButton(shader, uiVAO, uiVBO, MainMenuButtonRect(1), "INSTRUCCIONES", mouseX, mouseY);
+    DrawMenuButton(shader, uiVAO, uiVBO, MainMenuButtonRect(2), "MAPA", mouseX, mouseY);
+}
+
+void DrawInstructions(Shader& shader, unsigned int uiVAO, unsigned int uiVBO, double mouseX, double mouseY)
+{
+    DrawUiRect(shader, uiVAO, uiVBO, { 0.0f, 0.0f, (float)gWindowWidth, (float)gWindowHeight },
+        glm::vec3(0.015f, 0.018f, 0.022f), 0.86f);
+
+    DrawCenteredText(shader, uiVAO, uiVBO, "INSTRUCCIONES",
+        CenteredRect(620.0f, 58.0f, 70.0f), 6.0f, glm::vec3(0.93f, 0.20f, 0.12f), 1.0f);
+
+    UiRect panel = CenteredRect(850.0f, 390.0f, 160.0f);
+    DrawUiRect(shader, uiVAO, uiVBO, panel, glm::vec3(0.06f, 0.07f, 0.075f), 0.88f);
+    DrawUiOutline(shader, uiVAO, uiVBO, panel, glm::vec3(0.44f, 0.12f, 0.11f), 1.0f, 3.0f);
+
+    DrawText(shader, uiVAO, uiVBO,
+        "CONTROLES\n\n"
+        "W A S D   MOVERSE\n"
+        "MOUSE     MIRAR\n"
+        "Z         DISPARAR\n"
+        "ESPACIO   SALTAR\n"
+        "C         AGACHARSE\n"
+        "M         MAPA PAUSA\n"
+        "ESC       SALIR",
+        panel.x + 70.0f, panel.y + 50.0f, 3.5f,
+        glm::vec3(0.88f, 0.86f, 0.76f), 1.0f);
+
+    DrawMenuButton(shader, uiVAO, uiVBO, BackButtonRect(), "VOLVER", mouseX, mouseY);
+}
+
+void DrawMapScreen(Shader& shader, unsigned int uiVAO, unsigned int uiVBO, double mouseX, double mouseY)
+{
+    DrawUiRect(shader, uiVAO, uiVBO, { 0.0f, 0.0f, (float)gWindowWidth, (float)gWindowHeight },
+        glm::vec3(0.012f, 0.017f, 0.019f), 0.88f);
+
+    DrawCenteredText(shader, uiVAO, uiVBO, "MAPA",
+        CenteredRect(320.0f, 58.0f, 60.0f), 7.0f, glm::vec3(0.93f, 0.20f, 0.12f), 1.0f);
+
+    UiRect mapRect = CenteredRect(760.0f, 390.0f, 145.0f);
+    DrawUiRect(shader, uiVAO, uiVBO, mapRect, glm::vec3(0.03f, 0.05f, 0.05f), 0.95f);
+    DrawUiOutline(shader, uiVAO, uiVBO, mapRect, glm::vec3(0.18f, 0.56f, 0.52f), 1.0f, 3.0f);
+
+    DrawMapWorldRect(shader, uiVAO, uiVBO, mapRect, -27.0f, -17.2f, -3.0f, 22.2f, glm::vec3(0.10f, 0.22f, 0.20f), 0.95f);
+    DrawMapWorldRect(shader, uiVAO, uiVBO, mapRect, -27.0f, -17.2f, -26.2f, 22.2f, glm::vec3(0.47f, 0.09f, 0.08f), 1.0f);
+    DrawMapWorldRect(shader, uiVAO, uiVBO, mapRect, -3.8f, -17.2f, -3.0f, 22.2f, glm::vec3(0.47f, 0.09f, 0.08f), 1.0f);
+    DrawMapWorldRect(shader, uiVAO, uiVBO, mapRect, -27.0f, 21.4f, -3.0f, 22.2f, glm::vec3(0.47f, 0.09f, 0.08f), 1.0f);
+    DrawMapWorldRect(shader, uiVAO, uiVBO, mapRect, -27.0f, -17.2f, -3.0f, -16.4f, glm::vec3(0.47f, 0.09f, 0.08f), 1.0f);
+
+    DrawMapWorldRect(shader, uiVAO, uiVBO, mapRect, -20.6f, 18.5f, -17.4f, 19.1f, glm::vec3(0.88f, 0.66f, 0.18f), 1.0f);
+    DrawMapWorldRect(shader, uiVAO, uiVBO, mapRect, -12.2f, 7.6f, -11.8f, 10.4f, glm::vec3(0.88f, 0.66f, 0.18f), 1.0f);
+    DrawMapWorldRect(shader, uiVAO, uiVBO, mapRect, -23.7f, 4.7f, -23.3f, 7.3f, glm::vec3(0.88f, 0.66f, 0.18f), 1.0f);
+    DrawMapWorldRect(shader, uiVAO, uiVBO, mapRect, -18.5f, -4.3f, -15.5f, -3.7f, glm::vec3(0.88f, 0.66f, 0.18f), 1.0f);
+
+    glm::vec2 startPoint = WorldToMapPoint(mapRect, glm::vec3(-19.0f, 0.0f, 12.6f));
+    DrawUiRect(shader, uiVAO, uiVBO, { startPoint.x - 5.0f, startPoint.y - 5.0f, 10.0f, 10.0f },
+        glm::vec3(0.20f, 0.80f, 0.40f), 1.0f);
+    DrawText(shader, uiVAO, uiVBO, "INICIO", startPoint.x + 10.0f, startPoint.y - 8.0f, 2.0f,
+        glm::vec3(0.75f, 0.90f, 0.70f), 1.0f);
+
+    glm::vec2 enemyPoint = WorldToMapPoint(mapRect, glm::vec3(-19.0f, 0.0f, -6.6f));
+    DrawUiRect(shader, uiVAO, uiVBO, { enemyPoint.x - 6.0f, enemyPoint.y - 6.0f, 12.0f, 12.0f },
+        glm::vec3(0.60f, 0.25f, 0.86f), 1.0f);
+    DrawText(shader, uiVAO, uiVBO, "ENEMIGO", enemyPoint.x + 12.0f, enemyPoint.y - 8.0f, 2.0f,
+        glm::vec3(0.82f, 0.70f, 0.95f), 1.0f);
+
+    glm::vec2 playerPoint = WorldToMapPoint(mapRect, camera.Position);
+    DrawUiRect(shader, uiVAO, uiVBO, { playerPoint.x - 6.0f, playerPoint.y - 6.0f, 12.0f, 12.0f },
+        glm::vec3(0.95f, 0.10f, 0.08f), 1.0f);
+    DrawText(shader, uiVAO, uiVBO, "TU", playerPoint.x + 12.0f, playerPoint.y - 8.0f, 2.0f,
+        glm::vec3(0.95f, 0.82f, 0.72f), 1.0f);
+
+    DrawText(shader, uiVAO, uiVBO,
+        "ROJO TU POSICION   VERDE INICIO   AMARILLO PUERTAS",
+        mapRect.x + 24.0f, mapRect.y + mapRect.h + 22.0f, 2.0f,
+        glm::vec3(0.82f, 0.84f, 0.76f), 1.0f);
+
+    DrawText(shader, uiVAO, uiVBO,
+        "M O ENTER PARA VOLVER AL JUEGO",
+        mapRect.x + 24.0f, mapRect.y + mapRect.h + 48.0f, 2.0f,
+        glm::vec3(0.82f, 0.84f, 0.76f), 1.0f);
+
+    DrawMenuButton(shader, uiVAO, uiVBO, BackButtonRect(), "VOLVER", mouseX, mouseY);
+}
+
+void DrawMenuOverlay(Shader& shader, unsigned int uiVAO, unsigned int uiVBO, GLFWwindow* window)
+{
+    double mouseX = 0.0;
+    double mouseY = 0.0;
+    glfwGetCursorPos(window, &mouseX, &mouseY);
+
+    if (gCurrentScreen == GameScreen::MainMenu)
+        DrawMainMenu(shader, uiVAO, uiVBO, mouseX, mouseY);
+    else if (gCurrentScreen == GameScreen::Instructions)
+        DrawInstructions(shader, uiVAO, uiVBO, mouseX, mouseY);
+    else if (gCurrentScreen == GameScreen::Map)
+        DrawMapScreen(shader, uiVAO, uiVBO, mouseX, mouseY);
 }
 
 // ---------------------------------------------------------
@@ -568,6 +1264,22 @@ int main()
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
     glEnableVertexAttribArray(1);
 
+    // -----------------------------------------------------
+    // VAO UI dinamica para menu, texto y mapa
+    // -----------------------------------------------------
+    unsigned int uiVAO, uiVBO;
+    glGenVertexArrays(1, &uiVAO);
+    glGenBuffers(1, &uiVBO);
+
+    glBindVertexArray(uiVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, uiVBO);
+    glBufferData(GL_ARRAY_BUFFER, 6 * 4 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+
     glBindVertexArray(0);
 
     // -----------------------------------------------------
@@ -644,6 +1356,9 @@ int main()
 
     hudShader.use();
     hudShader.setInt("hudTexture", 0);
+    hudShader.setBool("useTexture", true);
+    hudShader.setVec3("tintColor", glm::vec3(1.0f));
+    hudShader.setFloat("alpha", 1.0f);
 
     // -----------------------------------------------------
     // Cargar GLTF
@@ -704,6 +1419,7 @@ int main()
     doorModels.clear();
 
     AddFloorCollider(glm::vec3(0.0f, floorY - 0.5f, 0.0f), glm::vec3(400.0f, 1.0f, 400.0f));
+    AddModelFloorColliders(doomWorld, doomWorldModel);
     AddModelTriangleWallColliders(doomWorld, doomWorldModel);
 
     AddWorldCollider(glm::vec3(-27.0f, -5.25f, 2.5f), glm::vec3(0.8f, 4.0f, 39.0f));
@@ -716,8 +1432,6 @@ int main()
     AddDoorModel(glm::vec3(-23.5f, -5.55f, 6.0f), glm::vec3(0.35f, 3.2f, 2.6f), exitDoorTex, 1.0f);
     AddDoorModel(glm::vec3(-17.0f, -5.55f, -4.0f), glm::vec3(3.0f, 3.2f, 0.35f), bigDoorTex, 1.0f);
     AddWorldCollider(glm::vec3(-19.0f, -5.15f, -6.60f), glm::vec3(1.5f, 2.2f, 1.5f));
-
-    std::cout << "Colliders cargados: " << worldColliders.size() << std::endl;
 
     // -----------------------------------------------------
     // Audio
@@ -765,6 +1479,8 @@ if (ma_sound_init_from_file(&gEngine, "sonidos/Cacodemon_sonido1.wav",
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
 
+        if (gCurrentScreen == GameScreen::Playing)
+        {
         processInput(window);
         MovePlayerWithCollisions(GetMovementInput(window));
         ApplyGravity();
@@ -844,11 +1560,20 @@ if (ma_sound_init_from_file(&gEngine, "sonidos/Cacodemon_sonido1.wav",
                 ++i;
         }
 
+        }
+        else
+        {
+            ProcessMenuInput(window);
+            gCurrentGunFrame = 0;
+            gGunAnimTime = 0.0f;
+        }
+
         glClearColor(0.05f, 0.05f, 0.08f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+        float aspectRatio = gWindowHeight > 0 ? (float)gWindowWidth / (float)gWindowHeight : 16.0f / 9.0f;
         glm::mat4 projection = glm::perspective(glm::radians(60.0f),
-            (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 500.0f);
+            aspectRatio, 0.1f, 500.0f);
 
         glm::mat4 view = camera.GetViewMatrix();
 
@@ -885,7 +1610,7 @@ if (ma_sound_init_from_file(&gEngine, "sonidos/Cacodemon_sonido1.wav",
         // -------------------------------------------------
         // DIBUJAR Cacodemon GLTF
         //---------------------------------------------
-        float time = glfwGetTime();
+        float time = (float)glfwGetTime();
         glm::mat4 animCaco = glm::mat4(1.0f); 
         animCaco = glm::translate(animCaco, glm::vec3(-19.0f, -5.35f, -6.60f)); // posición dentro del mapa
         animCaco = glm::scale(animCaco, glm::vec3(0.5f));
@@ -951,14 +1676,25 @@ if (ma_sound_init_from_file(&gEngine, "sonidos/Cacodemon_sonido1.wav",
 
         hudShader.use();
 
-        glBindVertexArray(gunVAO);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, gGunTextures[gCurrentGunFrame]);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
+        if (gCurrentScreen == GameScreen::Playing)
+        {
+            hudShader.setBool("useTexture", true);
+            hudShader.setVec3("tintColor", glm::vec3(1.0f));
+            hudShader.setFloat("alpha", 1.0f);
 
-        glBindVertexArray(hudVAO);
-        glBindTexture(GL_TEXTURE_2D, hudTex);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
+            glBindVertexArray(gunVAO);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, gGunTextures[gCurrentGunFrame]);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+
+            glBindVertexArray(hudVAO);
+            glBindTexture(GL_TEXTURE_2D, hudTex);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+        }
+        else
+        {
+            DrawMenuOverlay(hudShader, uiVAO, uiVBO, window);
+        }
 
         glDisable(GL_BLEND);
         glEnable(GL_DEPTH_TEST);
