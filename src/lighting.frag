@@ -22,7 +22,7 @@ void main()
     vec3 norm = normalize(Normal);
     vec3 lightDir = normalize(-dirLight.direction);
     vec2 scaledUV = TexCoord * texScale;
-    vec3 texColor = texture(texture_diffuse1, TexCoord).rgb;
+    vec3 texColor = texture(texture_diffuse1, scaledUV).rgb;
 
     vec3 ambient = dirLight.ambient * texColor;
 

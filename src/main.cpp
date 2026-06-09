@@ -1,3 +1,4 @@
+#define NOMINMAX
 #include <glad.h>
 #include <GLFW/glfw3.h>
 
@@ -19,6 +20,16 @@
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include <algorithm>
+#include <limits>
+
+#ifdef min
+#undef min
+#endif
+
+#ifdef max
+#undef max
+#endif
 
 // ---------------------------------------------------------
 // Colisiones
@@ -28,7 +39,8 @@ struct AABB {
     glm::vec3 max;
 };
 
-bool CheckCollision(const AABB& a, const AABB& b) {
+bool CheckCollision(const AABB& a, const AABB& b)
+{
     return (a.max.x > b.min.x &&
             a.min.x < b.max.x &&
             a.max.y > b.min.y &&
@@ -37,11 +49,160 @@ bool CheckCollision(const AABB& a, const AABB& b) {
             a.min.z < b.max.z);
 }
 
+struct DoorModel {
+    glm::vec3 center;
+    glm::vec3 size;
+    unsigned int texture;
+    float texScale;
+};
+
+const float playerRadius = 0.40f;
+const float playerEyeHeight = 1.75f;
+const float playerHeadClearance = 0.20f;
+const float floorY = -7.15f;
+
 AABB playerBox;
-float playerWidth  = 0.4f;
-float playerHeight = 1.8f;
 
 std::vector<AABB> worldColliders;
+std::vector<AABB> floorColliders;
+std::vector<DoorModel> doorModels;
+
+AABB MakeAABB(const glm::vec3& a, const glm::vec3& b)
+{
+    return { glm::min(a, b), glm::max(a, b) };
+}
+
+AABB MakeAABBFromCenter(const glm::vec3& center, const glm::vec3& size)
+{
+    glm::vec3 halfSize = size * 0.5f;
+    return MakeAABB(center - halfSize, center + halfSize);
+}
+
+AABB MakePlayerBox(const glm::vec3& position)
+{
+    return {
+        glm::vec3(position.x - playerRadius, position.y - playerEyeHeight, position.z - playerRadius),
+        glm::vec3(position.x + playerRadius, position.y + playerHeadClearance, position.z + playerRadius)
+    };
+}
+
+bool CollidesWithWorld(const glm::vec3& position)
+{
+    AABB candidate = MakePlayerBox(position);
+    for (const auto& box : worldColliders)
+    {
+        if (CheckCollision(candidate, box))
+            return true;
+    }
+
+    return false;
+}
+
+void AddWorldCollider(const glm::vec3& center, const glm::vec3& size)
+{
+    worldColliders.push_back(MakeAABBFromCenter(center, size));
+}
+
+void AddFloorCollider(const glm::vec3& center, const glm::vec3& size)
+{
+    AABB box = MakeAABBFromCenter(center, size);
+    floorColliders.push_back(box);
+    worldColliders.push_back(box);
+}
+
+void AddDoorModel(const glm::vec3& center, const glm::vec3& size, unsigned int texture, float texScale = 1.0f)
+{
+    doorModels.push_back({ center, size, texture, texScale });
+    worldColliders.push_back(MakeAABBFromCenter(center, size));
+}
+
+void ExpandThinWall(AABB& box, float minThickness)
+{
+    glm::vec3 size = box.max - box.min;
+
+    if (size.x < minThickness)
+    {
+        float padding = (minThickness - size.x) * 0.5f;
+        box.min.x -= padding;
+        box.max.x += padding;
+    }
+
+    if (size.z < minThickness)
+    {
+        float padding = (minThickness - size.z) * 0.5f;
+        box.min.z -= padding;
+        box.max.z += padding;
+    }
+}
+
+void AddModelWallColliders(const Model& model, const glm::mat4& transform)
+{
+    const float minWallHeight = 0.75f;
+    const float maxWallThickness = 0.45f;
+    const float colliderThickness = 0.35f;
+
+    for (const auto& mesh : model.meshes)
+    {
+        if (mesh.vertices.empty())
+            continue;
+
+        glm::vec3 minPoint(std::numeric_limits<float>::max());
+        glm::vec3 maxPoint(std::numeric_limits<float>::lowest());
+
+        for (const auto& vertex : mesh.vertices)
+        {
+            glm::vec3 worldPos = glm::vec3(transform * glm::vec4(vertex.Position, 1.0f));
+            minPoint = glm::min(minPoint, worldPos);
+            maxPoint = glm::max(maxPoint, worldPos);
+        }
+
+        AABB box = MakeAABB(minPoint, maxPoint);
+        glm::vec3 size = box.max - box.min;
+        bool thinOnX = size.x <= maxWallThickness && size.z >= maxWallThickness;
+        bool thinOnZ = size.z <= maxWallThickness && size.x >= maxWallThickness;
+
+        if (size.y >= minWallHeight && (thinOnX || thinOnZ))
+        {
+            ExpandThinWall(box, colliderThickness);
+            worldColliders.push_back(box);
+        }
+    }
+}
+
+void AddModelTriangleWallColliders(const Model& model, const glm::mat4& transform)
+{
+    const float minWallHeight = 0.35f;
+    const float maxVerticalNormalY = 0.35f;
+    const float colliderThickness = 0.32f;
+
+    for (const auto& mesh : model.meshes)
+    {
+        for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3)
+        {
+            const glm::vec3 p0 = glm::vec3(transform * glm::vec4(mesh.vertices[mesh.indices[i]].Position, 1.0f));
+            const glm::vec3 p1 = glm::vec3(transform * glm::vec4(mesh.vertices[mesh.indices[i + 1]].Position, 1.0f));
+            const glm::vec3 p2 = glm::vec3(transform * glm::vec4(mesh.vertices[mesh.indices[i + 2]].Position, 1.0f));
+
+            glm::vec3 normal = glm::cross(p1 - p0, p2 - p0);
+            if (glm::length(normal) < 0.0001f)
+                continue;
+
+            normal = glm::normalize(normal);
+            if (std::fabs(normal.y) > maxVerticalNormalY)
+                continue;
+
+            AABB box = MakeAABB(glm::min(p0, glm::min(p1, p2)), glm::max(p0, glm::max(p1, p2)));
+            glm::vec3 size = box.max - box.min;
+            if (size.y < minWallHeight)
+                continue;
+
+            box.min.y -= 0.05f;
+            box.max.y += 0.05f;
+            ExpandThinWall(box, colliderThickness);
+            worldColliders.push_back(box);
+        }
+    }
+}
 
 // ---------------------------------------------------------
 // Raycast + Decals
@@ -136,22 +297,91 @@ void mouse_callback(GLFWwindow* window, double xpos, double ypos)
     camera.ProcessMouseMovement(xoffset, yoffset);
 }
 
+glm::vec3 GetMovementInput(GLFWwindow* window)
+{
+    glm::vec3 forward(camera.Front.x, 0.0f, camera.Front.z);
+    glm::vec3 right(camera.Right.x, 0.0f, camera.Right.z);
+
+    if (glm::length(forward) > 0.0001f)
+        forward = glm::normalize(forward);
+    else
+        forward = glm::vec3(0.0f, 0.0f, -1.0f);
+
+    if (glm::length(right) > 0.0001f)
+        right = glm::normalize(right);
+    else
+        right = glm::vec3(1.0f, 0.0f, 0.0f);
+
+    glm::vec3 movement(0.0f);
+
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+        movement += forward;
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+        movement -= forward;
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+        movement -= right;
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+        movement += right;
+
+    if (glm::length(movement) > 0.0001f)
+        movement = glm::normalize(movement) * camera.MovementSpeed * deltaTime;
+
+    return movement;
+}
+
+void MovePlayerWithCollisions(const glm::vec3& delta)
+{
+    float distance = glm::length(glm::vec2(delta.x, delta.z));
+    int steps = std::max(1, (int)std::ceil(distance / 0.12f));
+    glm::vec3 step = delta / (float)steps;
+
+    for (int i = 0; i < steps; ++i)
+    {
+        glm::vec3 candidate = camera.Position;
+        candidate.x += step.x;
+        if (!CollidesWithWorld(candidate))
+            camera.Position.x = candidate.x;
+
+        candidate = camera.Position;
+        candidate.z += step.z;
+        if (!CollidesWithWorld(candidate))
+            camera.Position.z = candidate.z;
+    }
+}
+
+void ApplyGravity()
+{
+    playerVelocityY += gravity * deltaTime;
+    camera.Position.y += playerVelocityY * deltaTime;
+    isGrounded = false;
+
+    playerBox = MakePlayerBox(camera.Position);
+
+    for (const auto& box : floorColliders)
+    {
+        if (!CheckCollision(playerBox, box))
+            continue;
+
+        if (playerVelocityY <= 0.0f)
+        {
+            camera.Position.y = box.max.y + playerEyeHeight;
+            isGrounded = true;
+        }
+        else
+        {
+            camera.Position.y = box.min.y - playerHeadClearance;
+        }
+
+        playerVelocityY = 0.0f;
+        playerBox = MakePlayerBox(camera.Position);
+        return;
+    }
+}
+
 void processInput(GLFWwindow* window)
 {
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, true);
-
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
-        camera.ProcessKeyboard(FORWARD, deltaTime);
-
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
-        camera.ProcessKeyboard(BACKWARD, deltaTime);
-
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
-        camera.ProcessKeyboard(LEFT, deltaTime);
-
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
-        camera.ProcessKeyboard(RIGHT, deltaTime);
 
     if (glfwGetKey(window, GLFW_KEY_Z) == GLFW_PRESS)
         gIsFiring = true;
@@ -341,6 +571,26 @@ int main()
     glBindVertexArray(0);
 
     // -----------------------------------------------------
+    // VAO para puertas y props simples
+    // -----------------------------------------------------
+    unsigned int propVAO, propVBO;
+    glGenVertexArrays(1, &propVAO);
+    glGenBuffers(1, &propVBO);
+
+    glBindVertexArray(propVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, propVBO);
+    glBufferData(GL_ARRAY_BUFFER, cubeVerticesSize, cubeVertices, GL_STATIC_DRAW);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(3 * sizeof(float)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float), (void*)(6 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+
+    glBindVertexArray(0);
+
+    // -----------------------------------------------------
     // VAO para impactos (decals)
     // -----------------------------------------------------
     unsigned int decalVAO, decalVBO;
@@ -376,6 +626,8 @@ int main()
     gGunTextures[1] = loadTexture("textures/Gun_shoot2.gif");
     gGunTextures[2] = loadTexture("textures/Gun_shoot1.gif");
     unsigned int bulletHoleTex = loadTexture("textures/bullet-hole.png");
+    unsigned int exitDoorTex = loadTexture("assets/models/textures/EXITDOOR_baseColor.png");
+    unsigned int bigDoorTex = loadTexture("assets/models/textures/BIGDOOR1_baseColor.png");
 
     decalShader.use();
     decalShader.setInt("decalTex", 0);
@@ -398,6 +650,11 @@ int main()
     // -----------------------------------------------------
     Model doomWorld("assets/models/Mapa1.gltf");
     Model cacodemon("assets/models/Cacodemon3.gltf");
+
+    glm::mat4 doomWorldModel = glm::mat4(1.0f);
+    doomWorldModel = glm::translate(doomWorldModel, glm::vec3(0.0f, -7.15f, -5.0f));
+    doomWorldModel = glm::rotate(doomWorldModel, glm::radians(-90.0f), glm::vec3(1, 0, 0));
+    doomWorldModel = glm::scale(doomWorldModel, glm::vec3(0.02f));
 
 
     // ---------------------------------------------------------
@@ -441,6 +698,27 @@ int main()
         glm::vec3(-18.0f, 3.0f, 22.0f)
     });
 
+    // Reconstruir la lista final de colisiones con el sistema nuevo.
+    worldColliders.clear();
+    floorColliders.clear();
+    doorModels.clear();
+
+    AddFloorCollider(glm::vec3(0.0f, floorY - 0.5f, 0.0f), glm::vec3(400.0f, 1.0f, 400.0f));
+    AddModelTriangleWallColliders(doomWorld, doomWorldModel);
+
+    AddWorldCollider(glm::vec3(-27.0f, -5.25f, 2.5f), glm::vec3(0.8f, 4.0f, 39.0f));
+    AddWorldCollider(glm::vec3(-3.0f, -5.25f, 2.5f), glm::vec3(0.8f, 4.0f, 39.0f));
+    AddWorldCollider(glm::vec3(-15.0f, -5.25f, 22.2f), glm::vec3(24.0f, 4.0f, 0.8f));
+    AddWorldCollider(glm::vec3(-15.0f, -5.25f, -17.2f), glm::vec3(24.0f, 4.0f, 0.8f));
+
+    AddDoorModel(glm::vec3(-19.0f, -5.55f, 18.8f), glm::vec3(3.2f, 3.2f, 0.35f), bigDoorTex, 1.0f);
+    AddDoorModel(glm::vec3(-12.0f, -5.55f, 9.0f), glm::vec3(0.35f, 3.2f, 2.8f), exitDoorTex, 1.0f);
+    AddDoorModel(glm::vec3(-23.5f, -5.55f, 6.0f), glm::vec3(0.35f, 3.2f, 2.6f), exitDoorTex, 1.0f);
+    AddDoorModel(glm::vec3(-17.0f, -5.55f, -4.0f), glm::vec3(3.0f, 3.2f, 0.35f), bigDoorTex, 1.0f);
+    AddWorldCollider(glm::vec3(-19.0f, -5.15f, -6.60f), glm::vec3(1.5f, 2.2f, 1.5f));
+
+    std::cout << "Colliders cargados: " << worldColliders.size() << std::endl;
+
     // -----------------------------------------------------
     // Audio
     // -----------------------------------------------------
@@ -451,10 +729,12 @@ int main()
     }
 
     ma_sound bgm;
+    bool bgmReady = false;
     if (ma_sound_init_from_file(&gEngine, "sonidos/cdoomtheme.ogg",
         MA_SOUND_FLAG_STREAM | MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC,
         NULL, NULL, &bgm) == MA_SUCCESS)
     {
+        bgmReady = true;
         ma_sound_set_looping(&bgm, MA_TRUE);
         ma_sound_start(&bgm);
     }
@@ -463,20 +743,16 @@ int main()
     //Sonido Cacodemon
     //---------------------------------------------------------
 ma_sound cacoSound;
+bool cacoSoundReady = false;
+float nextCacoSoundTime = 10.0f;
 if (ma_sound_init_from_file(&gEngine, "sonidos/Cacodemon_sonido1.wav",
     MA_SOUND_FLAG_DECODE | MA_SOUND_FLAG_ASYNC,
     NULL, NULL, &cacoSound) == MA_SUCCESS)
 {
+    cacoSoundReady = true;
     ma_sound_set_looping(&cacoSound, MA_FALSE); // no repetir automáticamente
     ma_sound_set_volume(&cacoSound, 0.3f);      // volumen bajo
 }
-
-// Dentro del bucle principal:
-if (fmod(glfwGetTime(), 10.0f) < 0.1f) { // cada ~10 segundos
-    ma_sound_start(&cacoSound);
-}
-
-
 
     lastFrame = (float)glfwGetTime();
 
@@ -489,43 +765,15 @@ if (fmod(glfwGetTime(), 10.0f) < 0.1f) { // cada ~10 segundos
         deltaTime = currentFrame - lastFrame;
         lastFrame = currentFrame;
 
-        glm::vec3 oldPos = camera.Position;
-
-        // Aplicar gravedad
-        playerVelocityY += gravity * deltaTime;
-        camera.Position.y += playerVelocityY * deltaTime;
-
         processInput(window);
+        MovePlayerWithCollisions(GetMovementInput(window));
+        ApplyGravity();
 
-        // AABB del jugador
-        playerBox.min = camera.Position - glm::vec3(playerWidth, 0.0f, playerWidth);
-        playerBox.max = camera.Position + glm::vec3(playerWidth, playerHeight, playerWidth);
-
-        // Colisión jugador vs colliders
-        for (const auto& box : worldColliders)
+        if (cacoSoundReady && currentFrame >= nextCacoSoundTime)
         {
-            if (CheckCollision(playerBox, box))
-            {
-                if (playerVelocityY < 0.0f)
-                {
-                    isGrounded = true;
-                    playerVelocityY = 0.0f;
-                    camera.Position.y = oldPos.y;
-                }
-                else
-                {
-                    camera.Position = oldPos;
-                }
-            }
-        }
-
-        if (!isGrounded)
-        {
-            // sigue cayendo naturalmente
-        }
-        else
-        {
-            isGrounded = false;
+            ma_sound_seek_to_pcm_frame(&cacoSound, 0);
+            ma_sound_start(&cacoSound);
+            nextCacoSoundTime = currentFrame + 10.0f;
         }
 
         // Disparo + decals + chispas
@@ -612,16 +860,28 @@ if (fmod(glfwGetTime(), 10.0f) < 0.1f) { // cada ~10 segundos
         // -------------------------------------------------
         // DIBUJAR MUNDO GLTF
         // -------------------------------------------------
-        glm::mat4 model = glm::mat4(1.0f);
-        model = glm::translate(model, glm::vec3(0.0f, -7.15f, -5.0f));
-        model = glm::rotate(model, glm::radians(-90.0f), glm::vec3(1, 0, 0));
-        model = glm::scale(model, glm::vec3(0.02f));
-
-        lightingShader.setMat4("model", model);
+        lightingShader.setMat4("model", doomWorldModel);
         lightingShader.setFloat("texScale", 1.0f);
 
         doomWorld.Draw(lightingShader);
-        
+
+        glBindVertexArray(propVAO);
+        glActiveTexture(GL_TEXTURE0);
+
+        for (const auto& door : doorModels)
+        {
+            glm::mat4 doorMatrix = glm::mat4(1.0f);
+            doorMatrix = glm::translate(doorMatrix, door.center);
+            doorMatrix = glm::scale(doorMatrix, door.size);
+
+            glBindTexture(GL_TEXTURE_2D, door.texture);
+            lightingShader.setMat4("model", doorMatrix);
+            lightingShader.setFloat("texScale", door.texScale);
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+        }
+
+        glBindVertexArray(0);
+
         // -------------------------------------------------
         // DIBUJAR Cacodemon GLTF
         //---------------------------------------------
@@ -707,7 +967,11 @@ if (fmod(glfwGetTime(), 10.0f) < 0.1f) { // cada ~10 segundos
         glfwPollEvents();
     }
 
-    ma_sound_uninit(&bgm);
+    if (cacoSoundReady)
+        ma_sound_uninit(&cacoSound);
+
+    if (bgmReady)
+        ma_sound_uninit(&bgm);
     ma_engine_uninit(&gEngine);
 
     glfwTerminate();

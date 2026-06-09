@@ -1,0 +1,31 @@
+# Visual Studio user state
+.vs/
+.vscode/
+*.user
+*.suo
+*.vcxproj.user
+
+# CMake and build output
+/build/
+/build-*/
+/build_*/
+/out/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+
+# vcpkg manifest/install artifacts
+/vcpkg_installed/
+/packages/
+/buildtrees/
+/downloads/
+
+# Compiled binaries and intermediate files
+*.dll
+*.exe
+*.ilk
+*.lib
+*.obj
+*.pdb
+*.tlog
+*.log
