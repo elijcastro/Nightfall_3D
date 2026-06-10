@@ -19,6 +19,10 @@ add_executable(Nightfall_3D ${SRC_FILES})
 
 target_include_directories(Nightfall_3D PRIVATE include)
 
+set_property(TARGET Nightfall_3D PROPERTY
+    VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:Nightfall_3D>"
+)
+
 find_package(glfw3 CONFIG REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(glm CONFIG REQUIRED)

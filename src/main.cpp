@@ -25,6 +25,12 @@
 #include <array>
 #include <cctype>
 #include <string>
+#include <filesystem>
+#include <system_error>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #ifdef min
 #undef min
@@ -33,6 +39,20 @@
 #ifdef max
 #undef max
 #endif
+
+void SetWorkingDirectoryToExecutable()
+{
+#ifdef _WIN32
+    wchar_t exePathBuffer[MAX_PATH];
+    DWORD length = GetModuleFileNameW(nullptr, exePathBuffer, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH)
+        return;
+
+    std::filesystem::path exePath(exePathBuffer);
+    std::error_code ec;
+    std::filesystem::current_path(exePath.parent_path(), ec);
+#endif
+}
 
 // ---------------------------------------------------------
 // Colisiones
@@ -1190,6 +1210,7 @@ HitInfo Raycast(const glm::vec3& origin, const glm::vec3& dir, float maxDist)
 // ---------------------------------------------------------
 int main()
 {
+    SetWorkingDirectoryToExecutable();
     std::srand((unsigned int)std::time(nullptr));
 
     glfwInit();
