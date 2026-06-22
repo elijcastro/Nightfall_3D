@@ -59,6 +59,17 @@ struct DoorModel {
     float texScale;
 };
 
+struct Fireball
+{
+    glm::vec3 pos;
+    glm::vec3 dir;
+    float speed;
+    float life;
+};
+
+std::vector<Fireball> fireballs;
+
+
 const float playerRadius = 0.40f;
 const float standingPlayerEyeHeight = 1.45f;
 const float standingPlayerHeadClearance = 0.12f;
@@ -73,11 +84,26 @@ float currentPlayerHeadClearance = standingPlayerHeadClearance;
 bool isCrouching = false;
 
 glm::vec3 cacoPosition = glm::vec3(-20.0f, -5.0f, -4.60f);
+glm::vec3 caco2Position = glm::vec3(-18.0f, -5.0f, -4.60f);
 glm::vec3 cacoTargetPosition = cacoPosition;
 bool cacoIsMoving = false;
 float cacoMoveSpeed = 6.0f;
 float cacoHitFlashTime = 0.0f;
 float cacoHitFlashDuration = 0.25f;
+
+bool caco2Active = false;
+float caco2ActivationTimer = 0.0f;
+float caco2ActivationDelay = 1.5f; // espera 1.5 segundos antes de perseguir
+float fireballDamageDistance = 1.0f; // distancia para impactar al jugador
+int fireballDamage = 1;              // daño por bola de fuego
+float caco2MinDistance = 6.0f; // no se acerca más de 6 metros
+float caco2DodgeChance = 0.35f; // 35% de chance de esquivar
+float caco2DodgeSpeed = 2.0f;   // velocidad lateral
+float caco2DodgeDistance = 1.5f; // si la bala pasa a 1.5m, intenta esquivar
+
+unsigned int lifeIconTex;
+unsigned int enemyIconTex;
+
 
 ma_sound cacoHitSound;
 bool cacoHitSoundReady = false;
@@ -106,15 +132,35 @@ ma_sound playerDeathSound;
 bool playerHurtSoundReady = false;
 bool playerDeathSoundReady = false;
 
-int cacoHealth = 5;
+int currentArea = 1;
+
+int cacoHealth = 10;
 bool cacoHurt = false;
 float cacoHurtTimer = 0.0f;
+int caco2Health = 5;
+bool caco2Hurt = false;
+float caco2HurtTimer = 0.0f;
 bool cacoIsAlive = true;
+bool caco2IsAlive = false;
 float cacoSqueeze = 1.0f; // 1.0 = normal, <1.0 = comprimido
 
+int caco2RetryCount = 0;      // cuántas veces reaparece el Caco2
+int caco2RetryLimit = 3;      // máximo permitido
+bool fightingCaco2 = false;   // indica si estás en la fase del Caco2
+
+
+unsigned int fireballFrames[18];
+int fireballFrameCount = 18;
+float fireballAnimTime = 0.0f;
+int fireballAnimFrame = 0;
+float fireballFrameDuration = 0.05f; // 20 FPS estilo DOOM 64
 
 float fireCooldown = 0.0f;
 float fireRate = 0.25f; // 4 disparos por segundo
+
+float caco2FireCooldown = 0.0f;
+float caco2FireRate = 1.2f; // dispara cada 1.2 segundos
+
 
 ma_sound cacoHurtSound;
 ma_sound cacoDeathSound;
@@ -467,6 +513,7 @@ void drawFullScreenQuad()
     glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
+
 // ---------------------------------------------------------
 // Raycast + Decals
 // ---------------------------------------------------------
@@ -507,7 +554,8 @@ enum class GameScreen {
     MainMenu,
     Instructions,
     Map,
-    Playing
+    Playing,
+    MissionComplete
 };
 
 GameScreen gCurrentScreen = GameScreen::MainMenu;
@@ -572,7 +620,22 @@ void SetCursorForCurrentScreen(GLFWwindow* window);
 
 bool cacoIsExploding = false;
 float cacoExplosionTimer = 0.0f;
+bool caco2IsExploding = false;
+float caco2ExplosionTimer = 0.0f;
+float caco2ExplosionDuration = 1.0f; // igual que el primero
+
 unsigned int cacoExplosionTexture = 0;
+
+void ShootFireballFrom(glm::vec3 origin, glm::vec3 target)
+{
+    Fireball fb;
+    fb.pos = origin;
+    fb.dir = glm::normalize(target - origin);
+    fb.speed = 6.0f;
+    fb.life = 2.0f;
+
+    fireballs.push_back(fb);
+}
 
 
 // ---------------------------------------------------------
@@ -906,6 +969,14 @@ void processInput(GLFWwindow* window)
         return;
     }
 
+    if (KeyPressedOnce(window, GLFW_KEY_I, gMWasPressed))
+    {
+        gCurrentScreen = GameScreen::Instructions;
+        gIsFiring = false;
+        SetCursorForCurrentScreen(window);
+        return;
+    }
+
     UpdateCrouch(window);
 
     bool jumpPressed = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
@@ -1122,6 +1193,37 @@ void DrawUiRect(Shader& shader, unsigned int uiVAO, unsigned int uiVBO,
     glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), vertices);
     glDrawArrays(GL_TRIANGLES, 0, 6);
 }
+
+void DrawUiRectTextured(Shader& shader, unsigned int uiVAO, unsigned int uiVBO,
+                UiRect rect, glm::vec3 color, float alpha, unsigned int textureID)
+{
+    shader.use();
+    shader.setBool("useTexture", true);
+    shader.setVec3("tintColor", color);
+    shader.setFloat("alpha", alpha);
+
+    glBindVertexArray(uiVAO);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, textureID);
+
+    // Actualizar el rectángulo
+    float verts[24] =
+    {
+        rect.x,             rect.y,              0.0f, 0.0f,
+        rect.x + rect.w,    rect.y,              1.0f, 0.0f,
+        rect.x + rect.w,    rect.y + rect.h,     1.0f, 1.0f,
+
+        rect.x,             rect.y,              0.0f, 0.0f,
+        rect.x + rect.w,    rect.y + rect.h,     1.0f, 1.0f,
+        rect.x,             rect.y + rect.h,     0.0f, 1.0f
+    };
+
+    glBindBuffer(GL_ARRAY_BUFFER, uiVBO);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+    
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
 
 void DrawUiOutline(Shader& shader, unsigned int uiVAO, unsigned int uiVBO,
                    const UiRect& rect, const glm::vec3& color, float alpha, float thickness)
@@ -1351,6 +1453,102 @@ void DrawMapScreen(Shader& shader, unsigned int uiVAO, unsigned int uiVBO, doubl
     DrawMenuButton(shader, uiVAO, uiVBO, BackButtonRect(), "VOLVER", mouseX, mouseY);
 }
 
+void DrawMissionComplete(Shader& shader, unsigned int uiVAO, unsigned int uiVBO)
+{
+    // Fondo igual al menú
+    DrawUiRect(shader, uiVAO, uiVBO,
+        { 0.0f, 0.0f, (float)gWindowWidth, (float)gWindowHeight },
+        glm::vec3(0.02f, 0.02f, 0.025f), 0.78f);
+
+    // Título
+    DrawCenteredText(shader, uiVAO, uiVBO,
+        "MISION COMPLETADA",
+        CenteredRect(760.0f, 90.0f, 88.0f),
+        6.0f, glm::vec3(0.96f, 0.18f, 0.10f), 1.0f);
+
+    // Panel del mensaje
+    UiRect panel = CenteredRect(900.0f, 260.0f, 180.0f);
+    DrawUiRect(shader, uiVAO, uiVBO, panel,
+        glm::vec3(0.06f, 0.07f, 0.075f), 0.88f);
+    DrawUiOutline(shader, uiVAO, uiVBO, panel,
+        glm::vec3(0.44f, 0.12f, 0.11f), 1.0f, 3.0f);
+
+    // Texto del mensaje
+    DrawText(shader, uiVAO, uiVBO,
+        "Felicidades, ya lograste limpiar\n" 
+        "de enemigos esta area.\n"
+        "Pero aun te quedan mas areas\n" 
+        "y los enemigos no seran tan faciles.\n\n"
+        "Presiona ENTER para continuar.",
+        panel.x + 40.0f, panel.y + 40.0f,
+        3.5f, glm::vec3(0.88f, 0.86f, 0.76f), 1.0f);
+}
+
+UiRect PixelToNDC(const UiRect& r)
+{
+    float x  =  (r.x / gWindowWidth)  * 2.0f - 1.0f;
+    float y = 1.0f - (r.y / gWindowHeight) * 2.0f; 
+    float w  =  (r.w / gWindowWidth)  * 2.0f;
+    float h  =  (r.h / gWindowHeight) * 2.0f;
+
+    return { x, y, w, h };
+}
+
+void DrawGameplayHUD(Shader& hudShader,
+                     unsigned int hudVAO, unsigned int hudVBO,
+                     int playerHealth, int enemiesLeft, int areaNumber,
+                     unsigned int lifeIconTex, unsigned int enemyIconTex)
+
+{
+    glm::vec3 textColor = glm::vec3(0.95f, 0.85f, 0.70f);
+
+    // ============================
+    // ICONO DE VIDA
+    // ============================
+UiRect lifeRect = PixelToNDC({ 40.0f, gWindowHeight - 60.0f, 48.0f, 48.0f });
+
+DrawUiRectTextured(hudShader, hudVAO, hudVBO,
+    lifeRect,
+    glm::vec3(1.0f), 1.0f, lifeIconTex);
+
+
+
+    DrawText(hudShader, hudVAO, hudVBO,
+        std::to_string(playerHealth),
+        100.0f, gWindowHeight - 95.0f,
+        3.5f, textColor, 1.0f);
+
+    // ============================
+    // ICONO DE ENEMIGOS RESTANTES
+    // ============================
+UiRect enemyRect = PixelToNDC({ 40.0f, gWindowHeight - 120.0f, 48.0f, 48.0f });
+
+DrawUiRectTextured(hudShader, hudVAO, hudVBO,
+    enemyRect,
+    glm::vec3(1.0f), 1.0f, enemyIconTex);
+
+
+    DrawText(hudShader, hudVAO, hudVBO,
+        std::to_string(enemiesLeft),
+        100.0f, gWindowHeight - 155.0f,
+        3.5f, textColor, 1.0f);
+
+    // ============================
+    // AREA ACTUAL
+    // ============================
+    DrawText(hudShader, hudVAO, hudVBO,
+        "AREA:",
+        gWindowWidth - 260.0f, gWindowHeight - 95.0f,
+        3.5f, textColor, 1.0f);
+
+    DrawText(hudShader, hudVAO, hudVBO,
+        std::to_string(areaNumber),
+        gWindowWidth - 120.0f, gWindowHeight - 95.0f,
+        3.5f, textColor, 1.0f);
+}
+
+
+
 void DrawMenuOverlay(Shader& shader, unsigned int uiVAO, unsigned int uiVBO, GLFWwindow* window)
 {
     double mouseX = 0.0;
@@ -1363,7 +1561,10 @@ void DrawMenuOverlay(Shader& shader, unsigned int uiVAO, unsigned int uiVBO, GLF
         DrawInstructions(shader, uiVAO, uiVBO, mouseX, mouseY);
     else if (gCurrentScreen == GameScreen::Map)
         DrawMapScreen(shader, uiVAO, uiVBO, mouseX, mouseY);
+    else if (gCurrentScreen == GameScreen::MissionComplete)
+        DrawMissionComplete(shader, uiVAO, uiVBO);
 }
+
 
 // ---------------------------------------------------------
 // Carga de texturas
@@ -1465,6 +1666,15 @@ HitInfo Raycast(const glm::vec3& origin, const glm::vec3& dir, float maxDist)
     return hit;
 }
 
+float DistancePointToRay(glm::vec3 point, glm::vec3 rayOrigin, glm::vec3 rayDir)
+{
+    glm::vec3 v = point - rayOrigin;
+    glm::vec3 crossProd = glm::cross(v, rayDir);
+    return glm::length(crossProd);
+}
+
+
+
 float GetFloorHeightAt(const glm::vec3& pos)
 {
     float bestY = -9999.0f;
@@ -1559,6 +1769,14 @@ int main()
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
     glEnableVertexAttribArray(1);
+    
+    // -----------------------------------------------------
+    // VAO TEXTO 
+    // -----------------------------------------------------
+    unsigned int textVAO, textVBO;
+    glGenVertexArrays(1, &textVAO);
+    glGenBuffers(1, &textVBO);
+
 
     // -----------------------------------------------------
     // VAO arma
@@ -1645,13 +1863,23 @@ int main()
     // -----------------------------------------------------
     // Texturas HUD, arma y decal
     // -----------------------------------------------------
-    unsigned int hudTex = loadTexture("textures/hud.png");
+    unsigned int lifeIconTex = loadTexture("textures/Life.png");
+    unsigned int enemyIconTex = loadTexture("textures/Enemy.png");
+
     gGunTextures[0] = loadTexture("textures/Gun.gif");
     gGunTextures[1] = loadTexture("textures/Gun_shoot2.gif");
     gGunTextures[2] = loadTexture("textures/Gun_shoot1.gif");
     unsigned int bulletHoleTex = loadTexture("textures/bullet-hole.png");
     unsigned int exitDoorTex = loadTexture("assets/models/textures/EXITDOOR_baseColor.png");
     unsigned int bigDoorTex = loadTexture("assets/models/textures/BIGDOOR1_baseColor.png");
+    for (int i = 0; i < fireballFrameCount; i++)
+   {
+       std::string path = "textures/fireball/Fireball" + std::to_string(i + 1) + ".png";
+       fireballFrames[i] = loadTexture(path.c_str());
+   }
+
+    
+
 
     decalShader.use();
     decalShader.setInt("decalTex", 0);
@@ -1677,6 +1905,7 @@ int main()
     // -----------------------------------------------------
     Model doomWorld("assets/models/Mapa1.gltf");
     Model cacodemon("assets/models/Cacodemon3.gltf");
+    Model cacodemon2("assets/models/Cacodemon2.gltf");
     std::cout << "Cacodemon meshes: " << cacodemon.meshes.size() << std::endl;
     glm::mat4 doomWorldModel = glm::mat4(1.0f);
     doomWorldModel = glm::translate(doomWorldModel, glm::vec3(0.0f, -7.15f, -5.0f));
@@ -1987,31 +2216,78 @@ if (cacoIsAlive && cacoHasSeenPlayer && distToPlayer < cacoChaseRadius)
             }
             // Si X y Z están bloqueados → esquina real
         }
-    }
+     }
      
     // ===============================================
-// LEVITACIÓN AUTOMÁTICA DEL CACODEMON
-// ===============================================
+    // LEVITACIÓN AUTOMÁTICA DEL CACODEMON
+    // ===============================================
 
-// Altura deseada sobre el piso
-float hoverHeight = 0.55f;
+    // Altura deseada sobre el piso
+      float hoverHeight = 0.55f;
 
-// Encontrar piso debajo del Cacodemon
-float floorY = GetFloorHeightAt(cacoPosition);
+     // Encontrar piso debajo del Cacodemon
+     float floorY = GetFloorHeightAt(cacoPosition);
 
-if (floorY > -9000.0f)
-{
-    float targetY = floorY + hoverHeight;
+     if (floorY > -9000.0f)
+    {
+       float targetY = floorY + hoverHeight;
 
-    // Suavizar movimiento vertical
-    cacoPosition.y = glm::mix(cacoPosition.y, targetY, 10.0f * deltaTime);
-}
+       // Suavizar movimiento vertical
+       cacoPosition.y = glm::mix(cacoPosition.y, targetY, 10.0f * deltaTime);
+    }
     
     // Asegurar sonido de persecución
     if (!ma_sound_is_playing(&cacoIdleLoopSound))
         ma_sound_start(&cacoIdleLoopSound);
-}
-           // ---------------------------------------------------------
+  }
+
+  float caco2ChaseSpeed = 1.2f; // más lento que el primero
+
+   if (caco2IsAlive && !caco2Active)
+    {
+       caco2ActivationTimer += deltaTime;
+        if (caco2ActivationTimer >= caco2ActivationDelay)
+          caco2Active = true;
+   }
+
+   if (caco2IsAlive && caco2Active)
+     {
+       float dist2 = glm::distance(camera.Position, caco2Position);
+        
+        // Perseguir igual que el primero
+        if (dist2 < cacoChaseRadius)
+        {
+           glm::vec3 dir2 = glm::normalize(camera.Position - caco2Position);
+
+           // NO acercarse demasiado
+           if (dist2 > caco2MinDistance)
+           {
+              // se acerca
+              caco2Position += dir2 * caco2ChaseSpeed * deltaTime;
+           }
+           else
+           {
+              // se aleja un poco para mantener distancia
+             caco2Position -= dir2 * (caco2ChaseSpeed * 0.6f) * deltaTime;
+            }
+
+        }
+
+         // Tirar bolas de fuego
+        if (dist2 < 12.0f && caco2FireCooldown <= 0.0f)
+        {
+           ShootFireballFrom(caco2Position, camera.Position);
+           caco2FireCooldown = caco2FireRate;
+        }
+       
+       // Asegurar sonido de persecución
+        if (!ma_sound_is_playing(&cacoIdleLoopSound))
+        ma_sound_start(&cacoIdleLoopSound);
+      }
+
+
+
+// ---------------------------------------------------------
 // PASO 3 — Daño al jugador cuando el Cacodemon lo toca
 // ---------------------------------------------------------
 float touchDistance = 1.2f; // distancia para que el Cacodemon te toque
@@ -2057,12 +2333,6 @@ if (distToPlayer < touchDistance)
     }
 }
 
-        /*if (cacoSoundReady && currentFrame >= nextCacoSoundTime)
-        {
-            ma_sound_seek_to_pcm_frame(&cacoSound, 0);
-            ma_sound_start(&cacoSound);
-            nextCacoSoundTime = currentFrame + 10.0f;
-        }*/
 
         // =============================================================
 // DISPARO DEL JUGADOR
@@ -2079,6 +2349,22 @@ if (gIsFiring && fireCooldown == 0.0f)
     glm::vec3 dir = camera.Front;
 
     HitInfo hit = Raycast(origin, dir, 100.0f);
+
+    if (caco2IsAlive)
+    {
+        float distToRay = DistancePointToRay(caco2Position, origin, dir);
+
+        if (distToRay < caco2DodgeDistance)
+       {
+          float r = std::rand() / (float)RAND_MAX;
+           if (r < caco2DodgeChance)
+           {
+            glm::vec3 right = glm::normalize(glm::cross(dir, glm::vec3(0,1,0)));
+            caco2Position += right * caco2DodgeSpeed * deltaTime;
+           }
+        }
+    }
+ 
 
     // =============================================================
     // MATRIZ REAL DEL MODELO DEL CACODEMON (posición visual real)
@@ -2098,6 +2384,22 @@ if (gIsFiring && fireCooldown == 0.0f)
 
     // POSICIÓN REAL DEL MODELO EN EL MUNDO
     glm::vec3 cacoWorldPos = glm::vec3(modelCaco[3]);
+    
+    // =============================================================
+    // MATRIZ REAL DEL MODELO DEL CACODEMON 2
+    // =============================================================
+    glm::vec3 lookDir2 = glm::normalize(camera.Position - caco2Position);
+    float angleY2 = atan2(lookDir2.x, lookDir2.z);
+    angleY2 = glm::mix(0.0f, angleY2, 0.85f);
+
+    glm::mat4 modelCaco2 = glm::mat4(1.0f);
+    modelCaco2 = glm::translate(modelCaco2, caco2Position);
+    modelCaco2 = glm::rotate(modelCaco2, angleY2, glm::vec3(0,1,0));
+    modelCaco2 = glm::translate(modelCaco2, glm::vec3(0.0f, sin(time) * 1.0f, 0.0f));
+    modelCaco2 = glm::scale(modelCaco2, glm::vec3(0.003f));
+    modelCaco2 = glm::rotate(modelCaco2, glm::radians(-90.0f), glm::vec3(0,1,0));
+
+    glm::vec3 caco2WorldPos = glm::vec3(modelCaco2[3]);
 
     // =============================================================
     // COLLIDER REAL DEL CACODEMON (ajustado por escala 0.5)
@@ -2107,12 +2409,27 @@ if (gIsFiring && fireCooldown == 0.0f)
     AABB cacoBox;
     cacoBox.min = cacoWorldPos - cacoHalfSize;
     cacoBox.max = cacoWorldPos + cacoHalfSize;
+    // =============================================================
+    // COLLIDER REAL DEL CACODEMON2 (ajustado por escala 0.5)
+    // =============================================================
+    glm::vec3 caco2HalfSize = glm::vec3(0.3f, 0.3f, 0.3f);
+
+    AABB caco2Box;
+    caco2Box.min = caco2WorldPos - caco2HalfSize;
+    caco2Box.max = caco2WorldPos + caco2HalfSize;
 
     // =============================================================
     // RAYCAST CONTRA EL CACODEMON
     // =============================================================
     float tCaco;
     bool hitCaco = RayIntersectsAABB(origin, dir, cacoBox, tCaco);
+    
+    // =============================================================
+    // RAYCAST CONTRA EL CACODEMON2
+    // =============================================================
+    float tCaco2;
+    bool hitCaco2 = RayIntersectsAABB(origin, dir, caco2Box, tCaco2);
+
 
     // Distancia al impacto con el mundo
     float tWorld = 1e9f;
@@ -2139,7 +2456,7 @@ if (gIsFiring && fireCooldown == 0.0f)
         cacoPosition += back * 0.5f;
 
         // ===============================================
-        // BLOQUE DE MUERTE DEL CACODEMON (NUEVO)
+        // BLOQUE DE MUERTE DEL CACODEMON
         // ===============================================
         if (cacoHealth <= 0 && !cacoIsExploding)
         {
@@ -2187,8 +2504,43 @@ if (gIsFiring && fireCooldown == 0.0f)
         }
     }
     
+    // =============================================================
+// ¿LE PEGAMOS AL CACODEMON 2?
+// =============================================================
+if (hitCaco2 && tCaco2 < tWorld)
+{
+    caco2Health--;
+    caco2Hurt = true;
+    caco2HurtTimer = 0.2f;
+
+    if (cacoHurtSoundReady)
+        ma_sound_start(&cacoHurtSound);
+
+    glm::vec3 back2 = -glm::normalize(camera.Position - caco2WorldPos);
+    caco2Position += back2 * 0.5f;
+
+    if (caco2Health <= 0 && !caco2IsExploding)
+    {
+        caco2IsAlive = false;
+        caco2IsExploding = true;
+        caco2ExplosionTimer = 0.0f;
+
+        if (cacoDeathSoundReady)
+            ma_sound_start(&cacoDeathSound);
+    }
+  }
 
 }
+
+std::cout << "C1 alive: " << cacoIsAlive
+          << " exploding: " << cacoIsExploding
+          << " | C2 alive: " << caco2IsAlive
+          << " exploding: " << caco2IsExploding
+          << std::endl;
+
+
+
+
         // Animación arma
         if (gIsFiring)
         {
@@ -2226,9 +2578,33 @@ if (cacoIsExploding)
     if (cacoExplosionTimer >= 0.6f)
     {
         cacoIsExploding = false;
+            // Spawn del segundo Cacodemon
+        caco2IsAlive = true;
+        fightingCaco2 = true;
+        caco2Active = false;
+        caco2ActivationTimer = 0.0f;
+
     }
 }
 
+if (caco2IsExploding)
+{
+    caco2ExplosionTimer += deltaTime;
+
+    if (caco2ExplosionTimer >= caco2ExplosionDuration)
+    {
+        caco2IsExploding = false;   // ← ESTA LÍNEA ES LA QUE FALTABA
+    }
+}
+
+ // =============================================================
+// DETECTAR SI AMBOS CACODEMON ESTÁN MUERTOS
+// =============================================================
+if (!cacoIsAlive && !caco2IsAlive && !cacoIsExploding && !caco2IsExploding)
+{
+    currentArea++;
+    gCurrentScreen = GameScreen::MissionComplete;
+}
 
 
         // Actualizar chispas
@@ -2245,6 +2621,115 @@ if (cacoIsExploding)
                 ++i;
         }
 
+        // Actualizar bolas de fuego
+        for (size_t i = 0; i < fireballs.size();)
+       {
+          fireballs[i].life -= deltaTime;
+          fireballs[i].pos += fireballs[i].dir * fireballs[i].speed * deltaTime;
+
+          if (fireballs[i].life <= 0.0f)
+          fireballs.erase(fireballs.begin() + i);
+          else
+          ++i;
+        }
+        
+        // Impacto de fireballs contra el jugador
+        for (size_t i = 0; i < fireballs.size();)
+        {
+            float dist = glm::distance(fireballs[i].pos, camera.Position);
+          
+            if (dist < fireballDamageDistance)
+            {
+                if (!playerHurt) // evitar daño múltiple por frame
+                {
+      
+                // daño al jugador
+              playerHealth --;
+              playerHurt = true;
+              hurtTimer = 0.9f;
+
+              if (playerHurtSoundReady)
+              ma_sound_start(&playerHurtSound);
+              
+                // Si la vida llega a 0 → muerte
+              if (playerHealth <= 0)
+              {
+                    
+                    if (playerDeathSoundReady)
+                     ma_sound_start(&playerDeathSound);
+
+                    // Reiniciar juego
+                    gCurrentScreen = GameScreen::MainMenu;
+                    
+                    if (fightingCaco2)
+                    {
+                        caco2RetryCount++;
+
+                        if (caco2RetryCount >= caco2RetryLimit)
+                       {
+                            // Se acabaron los intentos → volver al Cacodemon 1
+                           fightingCaco2 = false;
+                           caco2RetryCount = 0;
+
+                           // Resetear Cacodemon 1
+                          cacoIsAlive = true;
+                          cacoHealth = 5;
+                          cacoPosition = glm::vec3(-20.0f, -5.35f, -4.60f);
+
+                          // Desactivar Cacodemon 2
+                          caco2IsAlive = false;
+                          caco2Health = 5;
+                          caco2Position = glm::vec3(-20.0f, -5.35f, -4.60f);
+                        }
+                    }
+
+                     // Resetear posición del jugador
+                    camera.Position = glm::vec3(-19.0f, -5.35f, 12.60f);
+                    cacoPosition = glm::vec3(-20.0f, -5.35f, -4.60f);
+                    caco2Position = glm::vec3(-20.0f, -5.35f, -4.60f);
+                   // Resetear vida
+                   playerHealth = 3;
+
+                   // Resetear estado del Cacodemon
+                   cacoHasSeenPlayer = false;
+                   cacoSightSoundPlayed = false;
+                   cacoDangerMusicPlaying = false;
+            
+
+                    ma_sound_stop(&cacoIdleLoopSound);
+                    ma_sound_stop(&cacoDangerMusic);
+                    ma_sound_set_looping(&bgm, MA_TRUE);
+                    ma_sound_start(&bgm);
+                }
+    
+              // eliminar fireball
+              fireballs.erase(fireballs.begin() + i);
+              continue;
+                   
+               } 
+            }
+         
+           ++i;
+        }
+
+        
+        // 3. Actualizar animación del sprite del fireball  ← ESTE ES EL NUEVO
+        fireballAnimTime += deltaTime;
+        if (fireballAnimTime >= fireballFrameDuration)
+        {
+           fireballAnimTime = 0.0f;
+           fireballAnimFrame++;
+
+            if (fireballAnimFrame >= fireballFrameCount)
+               fireballAnimFrame = 0;
+         }
+        
+        if (caco2FireCooldown > 0.0f)
+          caco2FireCooldown -= deltaTime;
+
+
+        
+       
         }
         else
         {
@@ -2252,6 +2737,34 @@ if (cacoIsExploding)
             gCurrentGunFrame = 0;
             gGunAnimTime = 0.0f;
         }
+       
+        // =============================================================
+        // INPUT PARA LA PANTALLA DE MISION COMPLETADA 
+        // =============================================================
+       
+    if (gCurrentScreen == GameScreen::MissionComplete)
+     {
+          if (glfwGetKey(window, GLFW_KEY_ENTER) == GLFW_PRESS)
+          {
+              gCurrentScreen = GameScreen::MainMenu;
+
+              // Resetear enemigos
+              cacoIsAlive = true;
+              cacoHealth = 5;
+              cacoPosition = glm::vec3(-20.0f, -5.35f, -4.60f);
+
+              caco2IsAlive = false;
+              caco2Health = 5;
+              caco2Position = glm::vec3(-20.0f, -5.35f, -4.60f);
+
+              // Resetear jugador
+              camera.Position = glm::vec3(-19.0f, -5.35f, 12.60f);
+              playerHealth = 3;
+
+              ma_sound_start(&bgm);
+           }
+      }
+       
 
         glClearColor(0.05f, 0.05f, 0.08f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -2266,6 +2779,9 @@ if (cacoIsExploding)
         lightingShader.setMat4("projection", projection);
         lightingShader.setMat4("view", view);
         lightingShader.setVec3("viewPos", camera.Position);
+
+       
+
 
         // -------------------------------------------------
         // DIBUJAR MUNDO GLTF
@@ -2331,12 +2847,35 @@ if (cacoIsExploding)
             // Color normal
             lightingShader.setVec3("tintColor", glm::vec3(1.0f, 1.0f, 1.0f));
         }
-        
-        
-        
-        
+                
         cacodemon.Draw(lightingShader);
-    }
+      }
+
+      
+      if (caco2IsAlive)
+      {
+         float time = (float)glfwGetTime();
+
+         glm::vec3 lookDir = glm::normalize(camera.Position - cacoPosition);
+         float angleY2 = atan2(lookDir.x, lookDir.z);
+         angleY2 = glm::mix(0.0f, angleY2, 0.85f); 
+        
+        glm::mat4 m2 = glm::mat4(1.0f); 
+         m2 = glm::translate(m2, caco2Position);
+         m2 = glm::rotate(m2, angleY2, glm::vec3(0,1,0));
+         m2 = glm::translate(m2, glm::vec3(0.0f, sin(time) * 1.0f, 0.0f));
+         m2 = glm::scale(m2, glm::vec3(0.003f));
+         m2 = glm::rotate(m2, glm::radians(-90.0f), glm::vec3(0,1,0));
+
+          lightingShader.setMat4("model", m2);
+          lightingShader.setFloat("texScale", 1.0f);
+
+          cacodemon2.Draw(lightingShader);
+      }
+      
+     
+      
+
     
      // =========================
      // RENDER EXPLOSIÓN
@@ -2406,6 +2945,31 @@ if (cacoIsExploding)
 
         glDisable(GL_BLEND);
 
+        // =========================
+        // RENDER FIREBALLS
+        // =========================
+        spriteShader.use();
+        spriteShader.setMat4("view", view);
+        spriteShader.setMat4("projection", projection);
+
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        for (auto& fb : fireballs)
+       {
+           glm::mat4 m = glm::mat4(1.0f);
+            m = glm::translate(m, fb.pos);
+            m = glm::scale(m, glm::vec3(0.45f)); // tamaño fireball
+
+           spriteShader.setMat4("model", m);
+
+           glBindTexture(GL_TEXTURE_2D, fireballFrames[fireballAnimFrame]); // usa tu textura de bola de fuego
+           DrawBillboardQuad();
+        }
+
+        glDisable(GL_BLEND);
+
+
         // -------------------------------------------------
         // HUD + arma
         // -------------------------------------------------
@@ -2425,10 +2989,18 @@ if (cacoIsExploding)
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, gGunTextures[gCurrentGunFrame]);
             glDrawArrays(GL_TRIANGLES, 0, 6);
+            
+           // HUD NUEVO
+          int enemiesLeft = (cacoIsAlive ? 1 : 0) + (caco2IsAlive ? 1 : 0);
 
-            glBindVertexArray(hudVAO);
-            glBindTexture(GL_TEXTURE_2D, hudTex);
-            glDrawArrays(GL_TRIANGLES, 0, 6);
+DrawGameplayHUD(hudShader,
+                hudVAO, hudVBO,
+                playerHealth,
+                enemiesLeft,
+                currentArea,
+                lifeIconTex,
+                enemyIconTex);
+
         }
         else
         {
